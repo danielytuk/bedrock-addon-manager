@@ -6,6 +6,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: windows-latest
@@ -23,7 +26,6 @@ jobs:
         run: python tests/test_pipeline.py
 
   build:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: test
     runs-on: windows-latest
     steps:
@@ -33,40 +35,40 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Set tag name
+        id: set_tag
+        shell: pwsh
+        run: |
+          $tag = "v1.0.${{ github.run_number }}"
+          echo "tag_name=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Inject version from tag
+        shell: pwsh
+        run: |
+          Set-Content -Path "version.py" -Value "VERSION = `"${{ steps.set_tag.outputs.tag_name }}`""
+
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Inject version from tag
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          Set-Content -Path "version.py" -Value "VERSION = `"$tag`""
-
       - name: Build executable
         run: pyinstaller build.spec
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: BedrockAddonManager_${{ github.ref_name }}
-          path: dist/BedrockAddonManager_${{ github.ref_name }}.exe
-
-      - name: Create release
+      - name: Create release and tag
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ steps.set_tag.outputs.tag_name }}
+          name: ${{ steps.set_tag.outputs.tag_name }}
           body: |
-            ## Bedrock Addon Manager — ${{ github.ref_name }}
+            ## Bedrock Addon Manager — ${{ steps.set_tag.outputs.tag_name }}
 
             ### Changes
             - See commits for details.
 
             ### Installation
-            1. Download `BedrockAddonManager_${{ github.ref_name }}.exe` from Assets below
+            1. Download `BedrockAddonManager_${{ steps.set_tag.outputs.tag_name }}.exe` from Assets below
             2. Run the executable (no installation required)
             3. Audio support is built-in (FFmpeg bundled via imageio-ffmpeg)
           files: |
-            dist/BedrockAddonManager_${{ github.ref_name }}.exe
+            dist/BedrockAddonManager_${{ steps.set_tag.outputs.tag_name }}.exe
