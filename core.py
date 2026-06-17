@@ -6,8 +6,10 @@ import subprocess
 import tempfile
 import uuid as uuid_mod
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Callable
 
 from imageio_ffmpeg import get_ffmpeg_exe
@@ -36,13 +38,26 @@ class AddonItem:
     pack_description: str = ""
     new_rp_uuid: str = ""
     new_bp_uuid: str = ""
+    is_directory: bool = False
 
     @property
     def file_name(self) -> str:
-        return self.file_path.name
+        name = self.file_path.name
+        if self.is_directory:
+            name += " (folder)"
+        return name
 
     @property
     def file_size(self) -> int:
+        if self.is_directory:
+            total = 0
+            try:
+                for f in self.file_path.rglob("*"):
+                    if f.is_file():
+                        total += f.stat().st_size
+            except OSError:
+                pass
+            return total
         try:
             return self.file_path.stat().st_size
         except OSError:
@@ -88,7 +103,7 @@ def _classify_manifest(manifest_path: str, manifest_data: dict) -> tuple[bool, b
     return is_rp, is_bp
 
 
-def detect_packs(zip_path: Path) -> dict:
+def _detect_packs_from_zip(zip_path: Path) -> dict:
     result: dict = {
         "has_rp": False, "has_bp": False,
         "rp_manifest_path": None, "bp_manifest_path": None,
@@ -124,6 +139,67 @@ def detect_packs(zip_path: Path) -> dict:
     except (zipfile.BadZipFile, OSError):
         pass
     return result
+
+
+def _detect_packs_from_dir(source: Path) -> dict:
+    result: dict = {
+        "has_rp": False, "has_bp": False,
+        "rp_manifest_path": None, "bp_manifest_path": None,
+        "rp_original_uuid": None, "bp_original_uuid": None,
+        "pack_name": None, "pack_description": None,
+    }
+    if not source.is_dir():
+        return result
+    try:
+        for mpath in source.rglob("manifest.json"):
+            if "__MACOSX" in mpath.parts:
+                continue
+            try:
+                data = json.loads(mpath.read_text("utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            rel = mpath.relative_to(source).as_posix()
+            is_rp, is_bp = _classify_manifest(rel, data)
+            uuid_val = (data.get("header", {}) or {}).get("uuid", "")
+            if is_rp:
+                result.update(has_rp=True, rp_manifest_path=rel, rp_original_uuid=uuid_val)
+            if is_bp:
+                result.update(has_bp=True, bp_manifest_path=rel, bp_original_uuid=uuid_val)
+        for lang_path in source.rglob("texts/en_US.lang"):
+            if "__MACOSX" in lang_path.parts:
+                continue
+            try:
+                for line in lang_path.read_text("utf-8-sig").splitlines():
+                    line = line.strip()
+                    if line.startswith("pack.name="):
+                        result["pack_name"] = line.split("=", 1)[1].strip()
+                    elif line.startswith("pack.description="):
+                        result["pack_description"] = line.split("=", 1)[1].strip()
+            except Exception:
+                continue
+    except OSError:
+        pass
+    return result
+
+
+def detect_packs(source: Path) -> dict:
+    if source.is_dir():
+        return _detect_packs_from_dir(source)
+    return _detect_packs_from_zip(source)
+
+
+def _extract_owned_uuids(*manifest_dicts: dict | None) -> list[str]:
+    uuids = []
+    for manifest in manifest_dicts:
+        if not manifest:
+            continue
+        header = manifest.get("header", {})
+        if isinstance(header, dict) and UUID_RE.match(str(header.get("uuid", ""))):
+            uuids.append(header["uuid"])
+        for module in manifest.get("modules", []):
+            if isinstance(module, dict) and UUID_RE.match(str(module.get("uuid", ""))):
+                uuids.append(module["uuid"])
+    return uuids
 
 
 def _deep_replace_uuid(obj, uuid_map: dict[str, str]):
@@ -203,21 +279,61 @@ def _compress_audio_file(file_path: Path, ffmpeg_path: Path) -> tuple[int, int]:
     return original_size, original_size
 
 
+def _sanitize_folder_name(name: str) -> str:
+    safe = re.sub(r'[<>:"/\\|?*]', "_", name)
+    safe = re.sub(r"\s+", "_", safe)
+    return safe.strip("_") or "unnamed_pack"
+
+
+def merge_pack_entries(existing: list[dict], new: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for entry in existing:
+        pid = entry.get("pack_id")
+        if pid:
+            merged[pid] = entry
+    for entry in new:
+        pid = entry.get("pack_id")
+        if pid:
+            merged[pid] = entry
+    return sorted(merged.values(), key=lambda e: e.get("pack_id", ""))
+
+
+def _collect_media_files(tmp_root: Path):
+    images = []
+    audio = []
+    all_files = []
+    for f in sorted(tmp_root.rglob("*"), key=lambda p: str(p)):
+        if not f.is_file():
+            continue
+        all_files.append(f)
+        ext = f.suffix.lower()
+        if ext in IMAGE_EXT:
+            images.append(f)
+        elif ext in AUDIO_EXT:
+            audio.append(f)
+    return all_files, images, audio
+
+
 def process_addon(
     addon: AddonItem,
     output_dir: Path,
     on_progress: Callable[[int, str], None],
     cancel_flag: list[bool],
     ffmpeg_path: Path | None = None,
+    server_mode: bool = False,
 ):
-    if not addon.file_path.is_file():
-        raise FileNotFoundError(f"File not found: {addon.file_path}")
+    if not addon.file_path.exists():
+        raise FileNotFoundError(f"Source not found: {addon.file_path}")
 
     tmp_root = Path(tempfile.mkdtemp(prefix="bedrock_"))
     try:
-        on_progress(0, "Extracting archive...")
-        with zipfile.ZipFile(addon.file_path, "r") as zf:
-            zf.extractall(str(tmp_root))
+        if addon.file_path.is_dir():
+            on_progress(0, "Copying directory...")
+            shutil.copytree(str(addon.file_path), str(tmp_root), dirs_exist_ok=True)
+        else:
+            on_progress(0, "Extracting archive...")
+            with zipfile.ZipFile(addon.file_path, "r") as zf:
+                zf.extractall(str(tmp_root))
 
         on_progress(15, "Reading manifests...")
         rp_json = bp_json = None
@@ -249,13 +365,8 @@ def process_addon(
             return
 
         on_progress(25, "Generating new UUIDs...")
-        new_rp = make_uuid() if rp_json is not None else None
-        new_bp = make_uuid() if bp_json is not None else None
-        uuid_map = {}
-        if addon.rp_original_uuid and new_rp:
-            uuid_map[addon.rp_original_uuid] = new_rp
-        if addon.bp_original_uuid and new_bp:
-            uuid_map[addon.bp_original_uuid] = new_bp
+        owned_uuids = _extract_owned_uuids(rp_json, bp_json)
+        uuid_map = {uid: make_uuid() for uid in owned_uuids}
 
         if rp_json is not None:
             _deep_replace_uuid(rp_json, uuid_map)
@@ -263,6 +374,10 @@ def process_addon(
         if bp_json is not None:
             _deep_replace_uuid(bp_json, uuid_map)
             _patch_manifest_header(bp_json, addon.pack_name, addon.pack_description)
+
+        new_rp = uuid_map.get(addon.rp_original_uuid) if addon.rp_original_uuid else None
+        new_bp = uuid_map.get(addon.bp_original_uuid) if addon.bp_original_uuid else None
+
         if rp_json is not None and bp_json is not None and new_rp and new_bp:
             _ensure_dependencies(rp_json, bp_json, new_rp, new_bp)
 
@@ -280,54 +395,105 @@ def process_addon(
         if cancel_flag[0]:
             return
 
-        on_progress(35, "Compressing images...")
-        all_files = sorted(tmp_root.rglob("*"), key=lambda p: str(p))
-        image_files = [f for f in all_files if f.is_file() and f.suffix.lower() in IMAGE_EXT]
-        audio_files = [f for f in all_files if f.is_file() and f.suffix.lower() in AUDIO_EXT]
+        on_progress(35, "Analyzing media files...")
+        all_files, image_files, audio_files = _collect_media_files(tmp_root)
         ffmpeg_ok = ffmpeg_path is not None
         total_media = len(image_files) + (len(audio_files) if ffmpeg_ok else 0)
         processed_media = 0
         total_saved = 0
+        media_lock = Lock()
 
-        for f in image_files:
-            if cancel_flag[0]:
-                return
-            orig, comp = _compress_image_file(f)
-            total_saved += orig - comp
-            processed_media += 1
-            if total_media > 0:
-                pct = 35 + int(30 * processed_media / total_media)
-                on_progress(min(pct, 65), f"Compressing images: {processed_media}/{total_media}")
-
-        if ffmpeg_ok:
-            for f in audio_files:
-                if cancel_flag[0]:
-                    return
-                orig, comp = _compress_audio_file(f, ffmpeg_path)
-                total_saved += orig - comp
+        def _report_media(pct_base: int, pct_range: int, label: str):
+            nonlocal processed_media
+            with media_lock:
                 processed_media += 1
                 if total_media > 0:
-                    pct = 35 + int(30 * processed_media / total_media)
-                    on_progress(min(pct, 65), f"Compressing audio: {processed_media}/{total_media}")
+                    pct = pct_base + int(pct_range * processed_media / total_media)
+                    on_progress(min(pct, pct_base + pct_range), f"{label}: {processed_media}/{total_media}")
+
+        on_progress(35, "Compressing images...")
+        if image_files:
+            def _compress_img(f: Path):
+                if cancel_flag[0]:
+                    return (0, 0)
+                return _compress_image_file(f)
+
+            with ThreadPoolExecutor(max_workers=max(1, os.cpu_count() - 1)) as ex:
+                fut_map = {ex.submit(_compress_img, f): f for f in image_files}
+                for future in as_completed(fut_map):
+                    if cancel_flag[0]:
+                        break
+                    orig, comp = future.result()
+                    with media_lock:
+                        total_saved += orig - comp
+                    _report_media(35, 15, "Compressing images")
+
+        if ffmpeg_ok and audio_files and not cancel_flag[0]:
+            on_progress(50, "Compressing audio...")
+            def _compress_aud(f: Path):
+                if cancel_flag[0]:
+                    return (0, 0)
+                return _compress_audio_file(f, ffmpeg_path)
+
+            with ThreadPoolExecutor(max_workers=max(1, os.cpu_count() - 1)) as ex:
+                fut_map = {ex.submit(_compress_aud, f): f for f in audio_files}
+                for future in as_completed(fut_map):
+                    if cancel_flag[0]:
+                        break
+                    orig, comp = future.result()
+                    with media_lock:
+                        total_saved += orig - comp
+                    _report_media(50, 15, "Compressing audio")
 
         if cancel_flag[0]:
             return
 
-        on_progress(70, "Repacking archive...")
-        stem = addon.file_path.stem
-        ext = addon.file_path.suffix.lower()
-        output_name = f"{stem}_patched{ext}" if not stem.endswith("_patched") else f"{stem}{ext}"
-        output_path = output_dir / output_name
-        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-            all_out = sorted(tmp_root.rglob("*"), key=lambda p: str(p))
-            for i, f in enumerate(all_out):
-                if f.is_file():
-                    zf.write(str(f), str(f.relative_to(tmp_root).as_posix()))
-                if cancel_flag[0]:
-                    return
-                if i % 50 == 0:
-                    pct = 70 + int(25 * i / max(len(all_out), 1))
-                    on_progress(min(pct, 95), f"Packing: {f.relative_to(tmp_root)}")
+        if server_mode:
+            on_progress(70, "Deploying packs...")
+            if rp_json is not None and rp_file_path is not None:
+                pack_name = rp_json.get("header", {}).get("name", "resource_pack")
+                folder = _sanitize_folder_name(pack_name)
+                rp_root = rp_file_path.parent
+                dest = output_dir / "resource_packs" / folder
+                dest.mkdir(parents=True, exist_ok=True)
+                for item in rp_root.rglob("*"):
+                    if item.is_file():
+                        rel = item.relative_to(rp_root)
+                        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(item), str(dest / rel))
+                on_progress(80, f"Deployed RP to resource_packs/{folder}")
+
+            if bp_json is not None and bp_file_path is not None:
+                pack_name = bp_json.get("header", {}).get("name", "behavior_pack")
+                folder = _sanitize_folder_name(pack_name)
+                bp_root = bp_file_path.parent
+                dest = output_dir / "behavior_packs" / folder
+                dest.mkdir(parents=True, exist_ok=True)
+                for item in bp_root.rglob("*"):
+                    if item.is_file():
+                        rel = item.relative_to(bp_root)
+                        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(item), str(dest / rel))
+                on_progress(90, f"Deployed BP to behavior_packs/{folder}")
+        else:
+            on_progress(70, "Repacking archive...")
+            stem = addon.file_path.stem
+            ext = addon.file_path.suffix.lower() if not addon.is_directory else ".mcaddon"
+            if addon.is_directory:
+                ext = ".mcaddon"
+                output_name = f"{stem}_patched{ext}"
+            else:
+                output_name = f"{stem}_patched{ext}" if not stem.endswith("_patched") else f"{stem}{ext}"
+            output_path = output_dir / output_name
+            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                for i, f in enumerate(all_files):
+                    if f.is_file():
+                        zf.write(str(f), str(f.relative_to(tmp_root).as_posix()))
+                    if cancel_flag[0]:
+                        return
+                    if i % 50 == 0:
+                        pct = 70 + int(25 * i / max(len(all_files), 1))
+                        on_progress(min(pct, 95), f"Packing: {f.relative_to(tmp_root)}")
 
         if cancel_flag[0]:
             return
